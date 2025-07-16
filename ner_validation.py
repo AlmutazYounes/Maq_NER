@@ -3,11 +3,15 @@ import numpy as np
 from typing import List, Tuple, Dict
 import torch
 import re
+import logging
 from sklearn.model_selection import train_test_split
 from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
-from sklearn.metrics import classification_report, precision_recall_fscore_support
 import warnings
 warnings.filterwarnings("ignore")
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 patterns = {
     'Email': {'pattern': r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', 'token': '[EMAIL]'},
@@ -47,399 +51,429 @@ patterns = {
     'USER_AGENT_STRING': {'pattern': r'(?:Mozilla|Opera|Chrome|Safari|Edge|Firefox|MSIE|Trident|Googlebot|Bingbot|Slurp|DuckDuckBot|YandexBot|curl|Wget|PostmanRuntime|Dalvik|okhttp|AppleWebKit|python-requests|Java)/[a-zA-Z0-9\s\(\)\;\.\/\-\_:,rv=x_]+[a-zA-Z0-9\/]', 'token': '[AGENT]'},
 }
 
+patterns_small = {
+    'Email': {'pattern': r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', 'token': '[EMAIL]'},
+    'URL_HTTP': {'pattern': r'https?://[^\s<>"{}|\\^`\[\]]+', 'token': '[URL]'},
+    'USER_AGENT_STRING': {'pattern': r'(?:Mozilla|Opera|Chrome|Safari|Edge|Firefox|MSIE|Trident|Googlebot|Bingbot|Slurp|DuckDuckBot|YandexBot|curl|Wget|PostmanRuntime|Dalvik|okhttp|AppleWebKit|python-requests|Java)/[a-zA-Z0-9\s\(\)\;\.\/\-\_:,rv=x_]+[a-zA-Z0-9\/]', 'token': '[AGENT]'},
+}
+
 class NERValidationEvaluator:
     def __init__(self, model_name: str, pattern_method: bool = False):
         self.model_name = model_name
         self.pattern_method = pattern_method
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForTokenClassification.from_pretrained(model_name)
-        self.ner_pipeline = pipeline("ner", 
-                                    model=self.model, 
-                                    tokenizer=self.tokenizer,
-                                    aggregation_strategy="simple",
-                                    device=0 if torch.cuda.is_available() else -1)
         
-        # Get all pattern tokens for later conversion to [MASK]
+        # Select patterns based on model name
+        if 'small' in model_name.lower():
+            self.patterns = patterns_small
+            logger.info(f"Using small patterns set for model: {model_name}")
+        else:
+            self.patterns = patterns
+            logger.info(f"Using full patterns set for model: {model_name}")
+        
+        logger.info(f"Loading model: {model_name}")
+        
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.model = AutoModelForTokenClassification.from_pretrained(model_name)
+            self.ner_pipeline = pipeline("ner", 
+                                        model=self.model, 
+                                        tokenizer=self.tokenizer,
+                                        aggregation_strategy="simple",
+                                        device=0 if torch.cuda.is_available() else -1)
+        except Exception as e:
+            logger.error(f"Failed to load model {model_name}: {str(e)}")
+            raise
+        
         if self.pattern_method:
-            self.pattern_tokens = set(pattern_info['token'] for pattern_info in patterns.values())
+            self.pattern_tokens = set(pattern_info['token'] for pattern_info in self.patterns.values())
+            self.sorted_patterns = sorted(self.patterns.items(), key=lambda x: len(x[1]['pattern']), reverse=True)
         
     def read_conll(self, file_path: str) -> Tuple[List[List[str]], List[List[str]]]:
+        """Read CoNLL format file and return sentences and labels."""
         sentences, labels = [], []
-        with open(file_path, encoding="utf-8") as f:
-            tokens, tags = [], []
-            for line in f:
-                line = line.strip()
-                if not line:
-                    if tokens:
-                        sentences.append(tokens)
-                        labels.append(tags)
-                        tokens, tags = [], []
-                else:
-                    if "\t" in line:
-                        token, tag = line.split("\t")
-                    elif " " in line:
-                        token, tag = line.split(" ", 1)
+        try:
+            with open(file_path, encoding="utf-8") as f:
+                tokens, tags = [], []
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        if tokens:
+                            sentences.append(tokens)
+                            labels.append(tags)
+                            tokens, tags = [], []
                     else:
-                        continue
-                    tokens.append(token)
-                    tags.append(tag)
-            if tokens:
-                sentences.append(tokens)
-                labels.append(tags)
-        return sentences, labels
+                        if "\t" in line:
+                            token, tag = line.split("\t", 1)
+                        elif " " in line:
+                            token, tag = line.split(" ", 1)
+                        else:
+                            continue
+                        tokens.append(token.strip())
+                        tags.append(tag.strip())
+                
+                if tokens:
+                    sentences.append(tokens)
+                    labels.append(tags)
+                    
+            logger.info(f"Read {len(sentences)} sentences from {file_path}")
+            return sentences, labels
+            
+        except Exception as e:
+            logger.error(f"Error reading file {file_path}: {str(e)}")
+            raise
     
     def get_validation_split(self, sentences: List[List[str]], tags: List[List[str]]) -> Tuple[List[List[str]], List[List[str]]]:
+        """Get validation split from the data."""
         _, val_sents, _, val_tags = train_test_split(sentences, tags, test_size=0.1, random_state=42)
+        logger.info(f"Validation split: {len(val_sents)} sentences")
         return val_sents, val_tags
     
-    def apply_patterns_to_text(self, text: str) -> str:
-        if not self.pattern_method:
-            return text
-        
-        modified_text = text
-        sorted_patterns = sorted(patterns.items(), 
-                               key=lambda x: len(x[1]['pattern']), 
-                               reverse=True)
-        for pattern_name, pattern_info in sorted_patterns:
-            pattern = pattern_info['pattern']
-            token = pattern_info['token']
-            try:
-                modified_text = re.sub(pattern, token, modified_text)
-            except re.error:
-                continue
-        return modified_text
-    
-    def convert_pattern_tokens_to_mask(self, tokens: List[str]) -> List[str]:
+    def apply_patterns_to_tokens(self, tokens: List[str]) -> List[str]:
+        """Apply patterns at token level."""
         if not self.pattern_method:
             return tokens
-        mask_tokens = []
+        
+        modified_tokens = []
         for token in tokens:
-            if token in self.pattern_tokens:
-                mask_tokens.append('[MASK]')
-            else:
-                mask_tokens.append(token)
-        return mask_tokens
+            matched = False
+            for pattern_name, pattern_info in self.sorted_patterns:
+                try:
+                    if re.fullmatch(pattern_info['pattern'], token):
+                        modified_tokens.append(pattern_info['token'])
+                        matched = True
+                        break
+                except re.error:
+                    continue
+            
+            if not matched:
+                modified_tokens.append(token)
+        
+        return modified_tokens
     
     def predict_sentence(self, tokens: List[str]) -> List[str]:
+        """Predict NER tags for a sentence."""
         try:
-            text = " ".join(tokens)
             if self.pattern_method:
-                text = self.apply_patterns_to_text(text)
-            predictions = self.ner_pipeline(text)
-            predicted_tags = ["O"] * len(tokens)
-            if self.pattern_method:
-                modified_tokens = text.split()
-                modified_predicted_tags = ["O"] * len(modified_tokens)
-                for pred in predictions:
-                    start_char = pred['start']
-                    end_char = pred['end']
-                    label = pred['entity_group']
-                    char_pos = 0
-                    for i, token in enumerate(modified_tokens):
-                        token_start = char_pos
-                        token_end = char_pos + len(token)
-                        if (token_start < end_char and token_end > start_char):
-                            if i == 0 or modified_predicted_tags[i-1] != label:
-                                modified_predicted_tags[i] = f"B-{label}"
-                            else:
-                                modified_predicted_tags[i] = f"I-{label}"
-                        char_pos = token_end + 1
-                for i, token in enumerate(modified_tokens):
-                    if token in self.pattern_tokens and modified_predicted_tags[i] == "O":
-                        modified_predicted_tags[i] = "B-MASK"
-                    elif token in self.pattern_tokens and modified_predicted_tags[i] != "O":
-                        if modified_predicted_tags[i].startswith("B-"):
-                            modified_predicted_tags[i] = "B-MASK"
-                        elif modified_predicted_tags[i].startswith("I-"):
-                            modified_predicted_tags[i] = "I-MASK"
-                if len(modified_predicted_tags) <= len(predicted_tags):
-                    predicted_tags[:len(modified_predicted_tags)] = modified_predicted_tags
-                else:
-                    predicted_tags = modified_predicted_tags[:len(predicted_tags)]
+                pattern_tokens = self.apply_patterns_to_tokens(tokens)
+                text = " ".join(pattern_tokens)
             else:
-                for pred in predictions:
-                    start_char = pred['start']
-                    end_char = pred['end']
-                    label = pred['entity_group']
-                    char_pos = 0
-                    for i, token in enumerate(tokens):
-                        token_start = char_pos
-                        token_end = char_pos + len(token)
-                        if (token_start < end_char and token_end > start_char):
-                            if i == 0 or predicted_tags[i-1] != label:
-                                predicted_tags[i] = f"B-{label}"
-                            else:
-                                predicted_tags[i] = f"I-{label}"
-                        char_pos = token_end + 1
+                text = " ".join(tokens)
+                pattern_tokens = tokens
+            
+            predictions = self.ner_pipeline(text)
+            predicted_tags = ["O"] * len(pattern_tokens)
+            
+            # Map character positions to token positions
+            char_to_token = {}
+            char_pos = 0
+            for token_idx, token in enumerate(pattern_tokens):
+                for i in range(len(token)):
+                    char_to_token[char_pos + i] = token_idx
+                char_pos += len(token) + 1
+            
+            for pred in predictions:
+                start_char = pred['start']
+                end_char = pred['end']
+                label = pred['entity_group']
+                
+                start_token = char_to_token.get(start_char, -1)
+                end_token = char_to_token.get(end_char - 1, -1)
+                
+                if start_token != -1 and end_token != -1:
+                    for token_idx in range(start_token, min(end_token + 1, len(pattern_tokens))):
+                        if token_idx == start_token:
+                            predicted_tags[token_idx] = f"B-{label}"
+                        else:
+                            predicted_tags[token_idx] = f"I-{label}"
+            
+            # Convert pattern tokens to PII labels
+            if self.pattern_method:
+                for i, token in enumerate(pattern_tokens):
+                    if token in self.pattern_tokens:
+                        if predicted_tags[i] == "O":
+                            predicted_tags[i] = "B-PII"
+                        elif predicted_tags[i].startswith("B-"):
+                            predicted_tags[i] = "B-PII"
+                        elif predicted_tags[i].startswith("I-"):
+                            predicted_tags[i] = "I-PII"
+            
             return predicted_tags
+            
         except Exception as e:
+            logger.warning(f"Error predicting sentence: {str(e)}")
             return ["O"] * len(tokens)
     
-    def extract_entities(self, tokens: List[str], tags: List[str]) -> List[Tuple[int, int, str]]:
+    def extract_entities(self, tokens: List[str], tags: List[str]) -> List[Tuple[int, int, str, str]]:
+        """Extract entities from BIO tags. Returns (start, end, label, text)."""
         entities = []
         current_entity = None
+        
         for i, tag in enumerate(tags):
             if tag.startswith("B-"):
                 if current_entity:
-                    entities.append(current_entity)
+                    start, end, label = current_entity
+                    entity_text = " ".join(tokens[start:end+1])
+                    entities.append((start, end, label, entity_text))
                 current_entity = (i, i, tag[2:])
             elif tag.startswith("I-") and current_entity and tag[2:] == current_entity[2]:
                 current_entity = (current_entity[0], i, current_entity[2])
             else:
                 if current_entity:
-                    entities.append(current_entity)
+                    start, end, label = current_entity
+                    entity_text = " ".join(tokens[start:end+1])
+                    entities.append((start, end, label, entity_text))
                 current_entity = None
+        
         if current_entity:
-            entities.append(current_entity)
+            start, end, label = current_entity
+            entity_text = " ".join(tokens[start:end+1])
+            entities.append((start, end, label, entity_text))
+        
         return entities
     
     def compute_iou(self, true_span: Tuple[int, int], pred_span: Tuple[int, int]) -> float:
+        """Compute IoU between two spans."""
         true_start, true_end = true_span
         pred_start, pred_end = pred_span
+        
         intersection_start = max(true_start, pred_start)
         intersection_end = min(true_end, pred_end)
         intersection = max(0, intersection_end - intersection_start + 1)
+        
         union = (true_end - true_start + 1) + (pred_end - pred_start + 1) - intersection
+        
         if union == 0:
             return 0.0
         return intersection / union
     
-    def compute_ner_metrics(self, true_entities: List[Tuple[int, int, str]], 
-                           pred_entities: List[Tuple[int, int, str]]) -> Dict:
+    def compute_metrics(self, true_entities: List[Tuple[int, int, str, str]], 
+                       pred_entities: List[Tuple[int, int, str, str]]) -> Dict:
+        """Compute the 12 leaderboard metrics."""
+        
         if len(true_entities) == 0 and len(pred_entities) == 0:
             return {
-                'exact_precision': 1.0, 'exact_recall': 1.0, 'exact_f1': 1.0,
-                'partial_precision': 1.0, 'partial_recall': 1.0, 'partial_f1': 1.0,
-                'iou50_precision': 1.0, 'iou50_recall': 1.0, 'iou50_f1': 1.0,
-                'value_precision': 1.0, 'value_recall': 1.0, 'value_f1': 1.0
+                'Exact Precision': 1.0, 'Exact Recall': 1.0, 'Exact F1': 1.0,
+                'Partial Precision': 1.0, 'Partial Recall': 1.0, 'Partial F1': 1.0,
+                'IoU50 Precision': 1.0, 'IoU50 Recall': 1.0, 'IoU50 F1': 1.0,
+                'Value Precision': 1.0, 'Value Recall': 1.0, 'Value F1': 1.0
             }
+        
         if len(pred_entities) == 0:
             return {
-                'exact_precision': 0.0, 'exact_recall': 0.0, 'exact_f1': 0.0,
-                'partial_precision': 0.0, 'partial_recall': 0.0, 'partial_f1': 0.0,
-                'iou50_precision': 0.0, 'iou50_recall': 0.0, 'iou50_f1': 0.0,
-                'value_precision': 0.0, 'value_recall': 0.0, 'value_f1': 0.0
+                'Exact Precision': 0.0, 'Exact Recall': 0.0, 'Exact F1': 0.0,
+                'Partial Precision': 0.0, 'Partial Recall': 0.0, 'Partial F1': 0.0,
+                'IoU50 Precision': 0.0, 'IoU50 Recall': 0.0, 'IoU50 F1': 0.0,
+                'Value Precision': 0.0, 'Value Recall': 0.0, 'Value F1': 0.0
             }
+        
         if len(true_entities) == 0:
             return {
-                'exact_precision': 0.0, 'exact_recall': 1.0, 'exact_f1': 0.0,
-                'partial_precision': 0.0, 'partial_recall': 1.0, 'partial_f1': 0.0,
-                'iou50_precision': 0.0, 'iou50_recall': 1.0, 'iou50_f1': 0.0,
-                'value_precision': 0.0, 'value_recall': 1.0, 'value_f1': 0.0
+                'Exact Precision': 0.0, 'Exact Recall': 1.0, 'Exact F1': 0.0,
+                'Partial Precision': 0.0, 'Partial Recall': 1.0, 'Partial F1': 0.0,
+                'IoU50 Precision': 0.0, 'IoU50 Recall': 1.0, 'IoU50 F1': 0.0,
+                'Value Precision': 0.0, 'Value Recall': 1.0, 'Value F1': 0.0
             }
+        
         exact_matches = 0
         partial_matches = 0
         iou50_matches = 0
         value_matches = 0
-        true_exact_matched = set()
-        true_partial_matched = set()
-        true_iou50_matched = set()
-        true_value_matched = set()
-        pred_exact_matched = set()
-        pred_partial_matched = set()
-        pred_iou50_matched = set()
-        pred_value_matched = set()
-        for pred_idx, (pred_start, pred_end, pred_type) in enumerate(pred_entities):
-            for true_idx, (true_start, true_end, true_type) in enumerate(true_entities):
+        
+        true_matched = {'exact': set(), 'partial': set(), 'iou50': set(), 'value': set()}
+        pred_matched = {'exact': set(), 'partial': set(), 'iou50': set(), 'value': set()}
+        
+        for pred_idx, (pred_start, pred_end, pred_type, pred_text) in enumerate(pred_entities):
+            for true_idx, (true_start, true_end, true_type, true_text) in enumerate(true_entities):
+                
+                # Exact match
                 if (pred_start, pred_end, pred_type) == (true_start, true_end, true_type):
-                    if pred_idx not in pred_exact_matched and true_idx not in true_exact_matched:
+                    if pred_idx not in pred_matched['exact'] and true_idx not in true_matched['exact']:
                         exact_matches += 1
-                        pred_exact_matched.add(pred_idx)
-                        true_exact_matched.add(true_idx)
+                        pred_matched['exact'].add(pred_idx)
+                        true_matched['exact'].add(true_idx)
+                
+                # Partial match
                 if pred_type == true_type:
                     overlap = max(0, min(pred_end, true_end) - max(pred_start, true_start) + 1)
                     if overlap > 0:
-                        if pred_idx not in pred_partial_matched and true_idx not in true_partial_matched:
+                        if pred_idx not in pred_matched['partial'] and true_idx not in true_matched['partial']:
                             partial_matches += 1
-                            pred_partial_matched.add(pred_idx)
-                            true_partial_matched.add(true_idx)
+                            pred_matched['partial'].add(pred_idx)
+                            true_matched['partial'].add(true_idx)
+                
+                # IoU50 match
                 if pred_type == true_type:
                     iou = self.compute_iou((true_start, true_end), (pred_start, pred_end))
                     if iou >= 0.5:
-                        if pred_idx not in pred_iou50_matched and true_idx not in true_iou50_matched:
+                        if pred_idx not in pred_matched['iou50'] and true_idx not in true_matched['iou50']:
                             iou50_matches += 1
-                            pred_iou50_matched.add(pred_idx)
-                            true_iou50_matched.add(true_idx)
-                if pred_type == true_type:
-                    if pred_idx not in pred_value_matched and true_idx not in true_value_matched:
+                            pred_matched['iou50'].add(pred_idx)
+                            true_matched['iou50'].add(true_idx)
+                
+                # Value match
+                if pred_text.strip().lower() == true_text.strip().lower():
+                    if pred_idx not in pred_matched['value'] and true_idx not in true_matched['value']:
                         value_matches += 1
-                        pred_value_matched.add(pred_idx)
-                        true_value_matched.add(true_idx)
-        def safe_divide(numerator, denominator):
-            return numerator / denominator if denominator > 0 else 0.0
-        def calc_f1(precision, recall):
-            return safe_divide(2 * precision * recall, precision + recall)
+                        pred_matched['value'].add(pred_idx)
+                        true_matched['value'].add(true_idx)
+        
+        def safe_divide(a, b):
+            return a / b if b > 0 else 0.0
+        
+        def calc_f1(p, r):
+            return safe_divide(2 * p * r, p + r)
+        
         exact_precision = safe_divide(exact_matches, len(pred_entities))
         exact_recall = safe_divide(exact_matches, len(true_entities))
-        exact_f1 = calc_f1(exact_precision, exact_recall)
+        
         partial_precision = safe_divide(partial_matches, len(pred_entities))
         partial_recall = safe_divide(partial_matches, len(true_entities))
-        partial_f1 = calc_f1(partial_precision, partial_recall)
+        
         iou50_precision = safe_divide(iou50_matches, len(pred_entities))
         iou50_recall = safe_divide(iou50_matches, len(true_entities))
-        iou50_f1 = calc_f1(iou50_precision, iou50_recall)
+        
         value_precision = safe_divide(value_matches, len(pred_entities))
         value_recall = safe_divide(value_matches, len(true_entities))
-        value_f1 = calc_f1(value_precision, value_recall)
+        
         return {
-            'exact_precision': exact_precision,
-            'exact_recall': exact_recall,
-            'exact_f1': exact_f1,
-            'partial_precision': partial_precision,
-            'partial_recall': partial_recall,
-            'partial_f1': partial_f1,
-            'iou50_precision': iou50_precision,
-            'iou50_recall': iou50_recall,
-            'iou50_f1': iou50_f1,
-            'value_precision': value_precision,
-            'value_recall': value_recall,
-            'value_f1': value_f1
+            'Exact Precision': exact_precision,
+            'Exact Recall': exact_recall,
+            'Exact F1': calc_f1(exact_precision, exact_recall),
+            'Partial Precision': partial_precision,
+            'Partial Recall': partial_recall,
+            'Partial F1': calc_f1(partial_precision, partial_recall),
+            'IoU50 Precision': iou50_precision,
+            'IoU50 Recall': iou50_recall,
+            'IoU50 F1': calc_f1(iou50_precision, iou50_recall),
+            'Value Precision': value_precision,
+            'Value Recall': value_recall,
+            'Value F1': calc_f1(value_precision, value_recall)
         }
     
-    def evaluate_single_sentence(self, tokens: List[str], true_tags: List[str]) -> Dict:
-        pred_tags = self.predict_sentence(tokens)
-        if self.pattern_method:
-            original_text = " ".join(tokens)
-            pattern_applied_text = self.apply_patterns_to_text(original_text)
-            pattern_tokens = pattern_applied_text.split()
-            true_tags_with_patterns = true_tags.copy()
-            for i, token in enumerate(tokens):
-                if i < len(pattern_tokens) and pattern_tokens[i] in self.pattern_tokens:
-                    true_tags_with_patterns[i] = "B-MASK"
-            true_tags = true_tags_with_patterns
-        min_len = min(len(true_tags), len(pred_tags))
-        true_tags = true_tags[:min_len]
-        pred_tags = pred_tags[:min_len]
-        true_entities = self.extract_entities(tokens[:min_len], true_tags)
-        pred_entities = self.extract_entities(tokens[:min_len], pred_tags)
-        ner_metrics = self.compute_ner_metrics(true_entities, pred_entities)
-        return {
-            'tokens': tokens[:min_len],
-            'true_tags': true_tags,
-            'pred_tags': pred_tags,
-            'true_entities': true_entities,
-            'pred_entities': pred_entities,
-            **ner_metrics,
-            'num_true_entities': len(true_entities),
-            'num_pred_entities': len(pred_entities)
-        }
-    
-    def evaluate_dataset(self, sentences: List[List[str]], tags: List[List[str]]) -> Tuple[Dict, List[Dict]]:
-        results = []
+    def evaluate_dataset(self, sentences: List[List[str]], tags: List[List[str]]) -> Dict:
+        """Evaluate entire dataset and return aggregated metrics."""
+        all_true_entities = []
+        all_pred_entities = []
+        
+        logger.info(f"Evaluating {len(sentences)} sentences...")
+        
         for i, (sentence, sentence_tags) in enumerate(zip(sentences, tags)):
+            if i > 0 and i % 100 == 0:
+                logger.info(f"Processed {i}/{len(sentences)} sentences")
+            
             try:
-                result = self.evaluate_single_sentence(sentence, sentence_tags)
-                result['sentence_idx'] = i
-                results.append(result)
+                pred_tags = self.predict_sentence(sentence)
+                
+                # Handle pattern method
+                if self.pattern_method:
+                    pattern_tokens = self.apply_patterns_to_tokens(sentence)
+                    modified_true_tags = sentence_tags.copy()
+                    
+                    for j, (orig_token, pattern_token) in enumerate(zip(sentence, pattern_tokens)):
+                        if j < len(modified_true_tags) and pattern_token in self.pattern_tokens:
+                            if modified_true_tags[j] == "O":
+                                modified_true_tags[j] = "B-PII"
+                            elif modified_true_tags[j].startswith("B-"):
+                                modified_true_tags[j] = "B-PII"
+                            elif modified_true_tags[j].startswith("I-"):
+                                modified_true_tags[j] = "I-PII"
+                    
+                    sentence_tags = modified_true_tags
+                
+                # Ensure same length
+                min_len = min(len(sentence_tags), len(pred_tags))
+                sentence_tags = sentence_tags[:min_len]
+                pred_tags = pred_tags[:min_len]
+                sentence = sentence[:min_len]
+                
+                # Extract entities
+                true_entities = self.extract_entities(sentence, sentence_tags)
+                pred_entities = self.extract_entities(sentence, pred_tags)
+                
+                # Adjust entity positions for global list
+                offset = len(all_true_entities)
+                true_entities = [(start + offset, end + offset, label, text) for start, end, label, text in true_entities]
+                pred_entities = [(start + offset, end + offset, label, text) for start, end, label, text in pred_entities]
+                
+                all_true_entities.extend(true_entities)
+                all_pred_entities.extend(pred_entities)
+                
             except Exception as e:
+                logger.warning(f"Failed to evaluate sentence {i}: {str(e)}")
                 continue
-        if not results:
-            return {}, []
-        metrics = {
-            'num_sentences': len(results),
-            'exact_precision': np.mean([r['exact_precision'] for r in results]),
-            'exact_recall': np.mean([r['exact_recall'] for r in results]),
-            'exact_f1': np.mean([r['exact_f1'] for r in results]),
-            'partial_precision': np.mean([r['partial_precision'] for r in results]),
-            'partial_recall': np.mean([r['partial_recall'] for r in results]),
-            'partial_f1': np.mean([r['partial_f1'] for r in results]),
-            'iou50_precision': np.mean([r['iou50_precision'] for r in results]),
-            'iou50_recall': np.mean([r['iou50_recall'] for r in results]),
-            'iou50_f1': np.mean([r['iou50_f1'] for r in results]),
-            'value_precision': np.mean([r['value_precision'] for r in results]),
-            'value_recall': np.mean([r['value_recall'] for r in results]),
-            'value_f1': np.mean([r['value_f1'] for r in results]),
-            'total_true_entities': sum([r['num_true_entities'] for r in results]),
-            'total_pred_entities': sum([r['num_pred_entities'] for r in results])
-        }
-        exact_f1_scores = [r['exact_f1'] for r in results]
-        partial_f1_scores = [r['partial_f1'] for r in results]
-        iou50_f1_scores = [r['iou50_f1'] for r in results]
-        value_f1_scores = [r['value_f1'] for r in results]
-        metrics['exact_f1_std'] = np.std(exact_f1_scores)
-        metrics['exact_f1_median'] = np.median(exact_f1_scores)
-        metrics['partial_f1_std'] = np.std(partial_f1_scores)
-        metrics['partial_f1_median'] = np.median(partial_f1_scores)
-        metrics['iou50_f1_std'] = np.std(iou50_f1_scores)
-        metrics['iou50_f1_median'] = np.median(iou50_f1_scores)
-        metrics['value_f1_std'] = np.std(value_f1_scores)
-        metrics['value_f1_median'] = np.median(value_f1_scores)
-        return metrics, results
+        
+        # Compute final metrics
+        metrics = self.compute_metrics(all_true_entities, all_pred_entities)
+        logger.info(f"Evaluation complete")
+        
+        return metrics
 
 def main():
     data_file = "conll_training_data.txt"
     models = [
+        "MutazYoune/arabic-ner-masking-patterns",
+        "MutazYoune/arabic-ner-masking-original", 
         "MutazYoune/ARAB_BERT-original",
         "MutazYoune/ARAB_BERT-patterns",
         "MutazYoune/Arabic-NER-PII-patterns",
-        "MutazYoune/Arabic-NER-PII-original"
+        "MutazYoune/Arabic-NER-PII",
+        "MutazYoune/Arabic-NER-PII-original",
+        "MutazYoune/Arabic-NER-PII-patterns_small",
+        "MutazYoune/ARAB_BERT-patterns_small",
+        "MutazYoune/bert-base-arabic-camelbert-mix-ner-patterns_small",
+        "MutazYoune/bert-base-arabic-camelbert-mix-ner-patterns",
+        "MutazYoune/bert-base-arabic-camelbert-mix-ner-original"
     ]
     results_path = "ner_validation_results.xlsx"
-    all_summaries = []
-    all_details = []
-    for model_name in models:
+    
+    results = []
+    
+    logger.info(f"Starting evaluation of {len(models)} models")
+    
+    for model_idx, model_name in enumerate(models, 1):
+        logger.info(f"Processing model {model_idx}/{len(models)}: {model_name}")
+        
         pattern_method = 'pattern' in model_name.lower()
+        
         try:
             evaluator = NERValidationEvaluator(model_name, pattern_method=pattern_method)
-        except Exception as e:
-            continue
-        sentences, tags = evaluator.read_conll(data_file)
-        val_sentences, val_tags = evaluator.get_validation_split(sentences, tags)
-        metrics, detailed_results = evaluator.evaluate_dataset(val_sentences, val_tags)
-        if detailed_results:
-            # Add model info to summary
-            summary_row = {
-                'model_name': model_name,
-                'data_file': data_file,
-                'pattern_method': pattern_method,
-                'num_sentences': metrics['num_sentences'],
-                'exact_precision': metrics['exact_precision'],
-                'exact_recall': metrics['exact_recall'],
-                'exact_f1': metrics['exact_f1'],
-                'partial_precision': metrics['partial_precision'],
-                'partial_recall': metrics['partial_recall'],
-                'partial_f1': metrics['partial_f1'],
-                'iou50_precision': metrics['iou50_precision'],
-                'iou50_recall': metrics['iou50_recall'],
-                'iou50_f1': metrics['iou50_f1'],
-                'value_precision': metrics['value_precision'],
-                'value_recall': metrics['value_recall'],
-                'value_f1': metrics['value_f1'],
-                'total_true_entities': metrics['total_true_entities'],
-                'total_pred_entities': metrics['total_pred_entities']
+            sentences, tags = evaluator.read_conll(data_file)
+            val_sentences, val_tags = evaluator.get_validation_split(sentences, tags)
+            metrics = evaluator.evaluate_dataset(val_sentences, val_tags)
+            
+            result = {
+                'Model': model_name,
+                **metrics
             }
-            all_summaries.append(summary_row)
-            # Add model info to each detailed row
-            for result in detailed_results:
-                row = {
-                    'model_name': model_name,
-                    'pattern_method': pattern_method,
-                    'sentence_idx': result['sentence_idx'],
-                    'sentence': ' '.join(result['tokens']),
-                    'true_tags': ' '.join(result['true_tags']),
-                    'pred_tags': ' '.join(result['pred_tags']),
-                    'exact_precision': result['exact_precision'],
-                    'exact_recall': result['exact_recall'],
-                    'exact_f1': result['exact_f1'],
-                    'partial_precision': result['partial_precision'],
-                    'partial_recall': result['partial_recall'],
-                    'partial_f1': result['partial_f1'],
-                    'iou50_precision': result['iou50_precision'],
-                    'iou50_recall': result['iou50_recall'],
-                    'iou50_f1': result['iou50_f1'],
-                    'value_precision': result['value_precision'],
-                    'value_recall': result['value_recall'],
-                    'value_f1': result['value_f1'],
-                    'num_true_entities': result['num_true_entities'],
-                    'num_pred_entities': result['num_pred_entities'],
-                    'true_entities': str(result['true_entities']),
-                    'pred_entities': str(result['pred_entities'])
-                }
-                all_details.append(row)
-    if all_summaries or all_details:
-        with pd.ExcelWriter(results_path, engine='openpyxl') as writer:
-            pd.DataFrame(all_summaries).to_excel(writer, sheet_name='Summary', index=False)
-            pd.DataFrame(all_details).to_excel(writer, sheet_name='Detailed_Results', index=False)
+            results.append(result)
+            
+            logger.info(f"✓ {model_name}: Exact F1={metrics['Exact F1']:.4f}")
+            
+        except Exception as e:
+            logger.error(f"✗ Failed to evaluate {model_name}: {str(e)}")
+            continue
+    
+    # Save results
+    if results:
+        df = pd.DataFrame(results)
+        df = df.sort_values('Exact F1', ascending=False)  # Sort by Exact F1
+        df.to_excel(results_path, index=False)
+        logger.info(f"Results saved to: {results_path}")
+        
+        print("\n" + "="*80)
+        print("RESULTS")
+        print("="*80)
+        for _, row in df.iterrows():
+            print(f"{row['Model']}")
+            print(f"  Exact F1: {row['Exact F1']:.4f}")
+            print(f"  Partial F1: {row['Partial F1']:.4f}")
+            print(f"  IoU50 F1: {row['IoU50 F1']:.4f}")
+            print(f"  Value F1: {row['Value F1']:.4f}")
+            print()
+    else:
+        logger.error("No results to save")
+    
+    logger.info("Evaluation complete!")
 
 if __name__ == "__main__":
     main() 
