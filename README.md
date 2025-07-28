@@ -3,16 +3,38 @@
 [![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)](https://pytorch.org/)
 [![Transformers](https://img.shields.io/badge/Transformers-4.20+-green.svg)](https://huggingface.co/transformers/)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Competition](https://img.shields.io/badge/Competition-Arabic%20PII%20Challenge-orange.svg)](https://huggingface.co/spaces/Maqsam/Arabic_PII_Leaderboard)
 
-A comprehensive Arabic Named Entity Recognition (NER) system designed for Personally Identifiable Information (PII) detection. This project implements multiple approaches combining deep learning models with pattern-based detection to achieve robust PII masking in Arabic text.
+A comprehensive Arabic Named Entity Recognition (NER) system designed for the [Arabic PII Redaction Challenge](https://huggingface.co/spaces/Maqsam/Arabic_PII_Leaderboard) on Hugging Face. This project addresses the unique challenges of Arabic PII detection by implementing multiple approaches combining deep learning models with pattern-based detection to achieve robust PII masking in Arabic text.
+
+## 🏆 Competition Context
+
+This project was developed for the **Arabic PII Redaction Challenge** - a $1000 prize competition focused on detecting and masking Personally Identifiable Information (PII) in Arabic text. The challenge addresses critical challenges in Arabic PII detection:
+
+- **Arabic names with semantic meanings** that are harder to distinguish from regular words
+- **Absence of capitalization** (unlike English where it's a key feature for name detection)  
+- **Complex morphological structure** of Arabic text
+- **Critical applications** in healthcare, finance, and government services across MENA region
+
+### Competition Requirements
+- Process **single Arabic sentences** at a time
+- Replace detected PII with `[MASKED]` tokens
+- Preserve sentence structure
+- Handle multiple PII types: personal names, phone numbers, emails, addresses, national IDs, bank info, dates of birth
+
+### Evaluation Metrics
+The competition uses token-level classification with a sophisticated scoring system:
+- **Precision**: Accuracy of masking decisions
+- **Recall**: Completeness of PII detection
+- **Final Score**: `0.45 × P_avg + 0.45 × R_avg + 0.1 × (1/time_avg)`
 
 ## 🚀 Features
 
 - **Multiple Model Architectures**: Support for various BERT-based models including Arabic-BERT, CAMeL-BERT, and custom Arabic NER models
 - **Pattern-Enhanced Detection**: Integration of 32+ regex patterns for improved PII detection accuracy
 - **Hybrid Approaches**: Combination of NER and pattern-based validation for comprehensive coverage
-- **Competition-Ready**: 16 different model variants optimized for Kaggle competitions
+- **Competition-Optimized**: 16 different model variants designed for the Arabic PII Challenge
+- **Speed-Conscious Design**: Models optimized for the competition's speed requirements
 - **Easy Integration**: Simple API for text masking and PII detection
 
 ## 📋 Supported PII Types
@@ -70,13 +92,18 @@ Maq_NER/
 ```python
 from submission.submission_Arabic_NER_PII_patterns import run
 
-# Example Arabic text with PII
-text = "اسمي أحمد محمد وإيميلي ahmed@example.com ورقمي 123-45-6789"
+# Example Arabic text with PII (competition format)
+text = "يعمل احمد محمد في شركة تقنية"
 
 # Mask PII in the text
 masked_text = run(text)
 print(masked_text)
-# Output: "اسمي [MASK] [MASK] وإيميلي [MASK] ورقمي [MASK]"
+# Output: "يعمل [MASKED] [MASKED] في شركة تقنية"
+
+# Another example with different PII types
+text = "للتواصل مع سارة على الرقم 0501234567"
+masked_text = run(text)
+# Output: "للتواصل مع [MASKED] على الرقم [MASKED]"
 ```
 
 ### Training Your Own Model
@@ -91,6 +118,8 @@ python kaggle_ner_training.py
 ```
 
 ## 📊 Model Variants
+
+Our 16 model variants are strategically designed to maximize both precision and recall while considering speed requirements for the competition:
 
 ### Original Models (Pure NER)
 - `submission_ARAB_BERT_original.py`
@@ -135,7 +164,20 @@ The system includes patterns for:
 
 ## 📈 Performance
 
-The models are evaluated using standard NER metrics:
-- **Precision**: Accuracy of positive predictions
-- **Recall**: Coverage of actual positive cases
+The models are evaluated using the competition's token-level classification metrics:
+
+### Core Metrics
+- **Precision**: Accuracy of masking decisions (`TP / (TP + FP)`)
+- **Recall**: Completeness of PII detection (`TP / (TP + FN)`)
 - **F1-Score**: Harmonic mean of precision and recall
+
+### Competition Scoring
+The final competition score is calculated as:
+```
+Score_final = 0.45 × P_avg + 0.45 × R_avg + 0.1 × (1/time_avg)
+```
+
+Where:
+- `P_avg`: Average precision across all test sentences
+- `R_avg`: Average recall across all test sentences  
+- `time_avg`: Average processing time per sentence
